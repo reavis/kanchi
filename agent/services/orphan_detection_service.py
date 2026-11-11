@@ -5,7 +5,7 @@ from typing import List
 from sqlalchemy import and_, func
 from sqlalchemy.orm import Session
 
-from database import TaskEventDB
+from database import TaskEventDB, TaskLatestDB
 from models import TaskEvent
 from constants import NON_TERMINAL_EVENT_TYPES, EventType
 
@@ -60,13 +60,17 @@ class OrphanDetectionService:
         grace_period_seconds: int
     ):
         task_ids = [task.task_id for task in orphaned_tasks]
-
-        self.session.query(TaskEventDB).filter(
-            TaskEventDB.task_id.in_(task_ids)
-        ).update({
+        orphan_values = {
             'is_orphan': True,
             'orphaned_at': orphaned_at
-        }, synchronize_session=False)
+        }
+
+        # Keep the task_latest snapshot (which backs the main task list) in sync
+        # with the event rows, otherwise the list keeps showing the pre-orphan status.
+        for model in (TaskEventDB, TaskLatestDB):
+            self.session.query(model).filter(
+                model.task_id.in_(task_ids)
+            ).update(orphan_values, synchronize_session=False)
 
         self.session.commit()
 

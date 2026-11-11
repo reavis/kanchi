@@ -2,6 +2,7 @@ import unittest
 from datetime import datetime, timezone, timedelta
 
 from services.orphan_detection_service import OrphanDetectionService
+from services.task_service import TaskService
 from tests.base import DatabaseTestCase
 
 
@@ -273,6 +274,32 @@ class TestOrphanDetectionService(DatabaseTestCase):
 
         self.assertEqual(len(orphaned_tasks), 1)
         self.assertEqual(orphaned_tasks[0].task_id, "task-2")
+
+    def test_orphan_detection_updates_task_list_snapshot(self):
+        task_service = TaskService(self.session)
+        task_service.save_task_event(self.create_task_event(
+            task_id="orphan-latest",
+            event_type="task-started",
+            timestamp=self.base_time,
+            hostname="worker1"
+        ))
+
+        orphaned_at = self.base_time + timedelta(seconds=10)
+        self.service.find_and_mark_orphaned_tasks(
+            hostname="worker1",
+            orphaned_at=orphaned_at
+        )
+
+        result = task_service.get_recent_events(aggregate=True)
+
+        self.assertEqual(len(result["data"]), 1)
+        listed = result["data"][0]
+        self.assertEqual(listed.task_id, "orphan-latest")
+        self.assertTrue(listed.is_orphan)
+        self.assertEqual(
+            listed.orphaned_at.replace(tzinfo=None, microsecond=0),
+            orphaned_at.replace(tzinfo=None, microsecond=0)
+        )
 
 
 if __name__ == '__main__':
