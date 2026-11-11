@@ -64,20 +64,16 @@ class TaskService:
             Exception: If database operation fails
         """
         try:
-            routing_key, queue = self._inherit_queue_info(task_event)
+            # Inherited data is written back onto the in-memory event (used for
+            # WebSocket broadcast) so downstream consumers don't lose it.
+            self._inherit_task_metadata(task_event)
             args, kwargs = self._parse_task_arguments(task_event)
             self._log_payload_truncation(task_event, args, kwargs, task_event.result)
 
-            # Ensure the in-memory event (used for WebSocket broadcast) carries the
-            # inherited data so downstream consumers don't lose it.
-            task_event.routing_key = routing_key
-            task_event.queue = queue
             task_event.args = args
             task_event.kwargs = kwargs
 
-            task_event_db = self._create_task_event_db(
-                task_event, routing_key, queue, args, kwargs
-            )
+            task_event_db = self._create_task_event_db(task_event, args, kwargs)
 
             self.session.add(task_event_db)
             self.session.flush()  # Ensure task_event_db.id is available for snapshot upsert
@@ -521,56 +517,58 @@ class TaskService:
             'recent_activity': recent_activity or 0
         }
 
-    def _inherit_queue_info(self, task_event: TaskEvent) -> Tuple[str, str]:
+    def _inherit_task_metadata(self, task_event: TaskEvent) -> None:
         """
-        Inherit routing metadata from earlier events in the same task lifecycle.
+        Inherit routing and lineage metadata from earlier events in the same task lifecycle.
 
-        Celery does not guarantee that every task event repeats the original queue
-        and routing information. Later lifecycle events such as task-succeeded may
-        omit queue or fall back to routing_key="default". In those cases we keep
-        the most recent meaningful routing metadata already seen for that task.
+        Celery does not guarantee that every task event repeats the original queue,
+        routing, and lineage information. Later lifecycle events such as task-succeeded
+        may omit queue/parent_id, fall back to routing_key="default", or report the
+        task's own id as root_id. In those cases we keep the most recent meaningful
+        value already seen for that task. The event is updated in place.
 
         Args:
             task_event: Task event to process
-
-        Returns:
-            Tuple of (routing_key, queue)
         """
-        routing_key = task_event.routing_key
-        queue = task_event.queue
+        placeholders = {
+            'routing_key': {'default'},
+            'queue': {'default'},
+            'root_id': {task_event.task_id},
+            'parent_id': set(),
+        }
 
-        routing_key_missing = not routing_key or routing_key == 'default'
-        queue_missing = not queue or queue == 'default'
+        def is_missing(field: str, value: Optional[str]) -> bool:
+            return not value or value in placeholders[field]
 
-        if not routing_key_missing and not queue_missing:
-            return routing_key, queue
+        missing = [
+            field for field in placeholders if is_missing(field, getattr(task_event, field))
+        ]
+        if not missing:
+            return
 
-        existing_event = (
+        meaningful_conditions = []
+        for field in missing:
+            column = getattr(TaskEventDB, field)
+            conditions = [column.isnot(None), column != '']
+            if placeholders[field]:
+                conditions.append(column.notin_(placeholders[field]))
+            meaningful_conditions.append(and_(*conditions))
+
+        existing_events = (
             self.session.query(TaskEventDB)
             .filter(TaskEventDB.task_id == task_event.task_id)
-            .filter(
-                or_(
-                    TaskEventDB.queue.isnot(None),
-                    and_(
-                        TaskEventDB.routing_key.isnot(None),
-                        TaskEventDB.routing_key != 'default'
-                    )
-                )
-            )
+            .filter(or_(*meaningful_conditions))
             .order_by(TaskEventDB.timestamp.desc(), TaskEventDB.id.desc())
-            .first()
         )
 
-        if not existing_event:
-            return routing_key, queue
-
-        if routing_key_missing and existing_event.routing_key:
-            routing_key = existing_event.routing_key
-
-        if queue_missing and existing_event.queue:
-            queue = existing_event.queue
-
-        return routing_key, queue
+        for existing_event in existing_events:
+            for field in list(missing):
+                value = getattr(existing_event, field)
+                if not is_missing(field, value):
+                    setattr(task_event, field, value)
+                    missing.remove(field)
+            if not missing:
+                break
 
     def _log_payload_truncation(
         self,
@@ -721,8 +719,6 @@ class TaskService:
     def _create_task_event_db(
         self,
         task_event: TaskEvent,
-        routing_key: str,
-        queue: str,
         args: Any,
         kwargs: Any
     ) -> TaskEventDB:
@@ -731,8 +727,6 @@ class TaskService:
 
         Args:
             task_event: Source task event
-            routing_key: Resolved routing key
-            queue: Resolved queue
             args: Parsed args
             kwargs: Parsed kwargs
 
@@ -746,9 +740,9 @@ class TaskService:
             timestamp=task_event.timestamp,
             hostname=task_event.hostname,
             worker_name=task_event.worker_name,
-            queue=queue,
+            queue=task_event.queue,
             exchange=task_event.exchange,
-            routing_key=routing_key,
+            routing_key=task_event.routing_key,
             root_id=task_event.root_id,
             parent_id=task_event.parent_id,
             args=args,
