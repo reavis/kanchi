@@ -1524,7 +1524,13 @@ class TaskService:
         return query
 
     def _apply_state_filter(self, query, operator: str, values: List[str], model=TaskEventDB):
-        """Apply state filter with operator support."""
+        """
+        Apply state filter with operator support.
+
+        Orphaned is a flag rather than an event type, and the UI shows a flagged task as
+        ORPHANED regardless of its last event. State matching mirrors that: ORPHANED
+        matches the flag, and every other state matches only tasks that aren't orphaned.
+        """
         def state_to_event_type(state: str) -> Optional[str]:
             try:
                 task_state = TaskState(state.upper())
@@ -1533,9 +1539,33 @@ class TaskService:
             except (ValueError, KeyError):
                 return None
 
-        return GenericFilter.apply(
-            query, getattr(model, 'event_type'), operator, values, state_to_event_type
-        )
+        if operator not in ('is', '', 'not', 'in', 'not_in'):
+            return GenericFilter.apply(
+                query, getattr(model, 'event_type'), operator, values, state_to_event_type
+            )
+
+        is_orphan = model.is_orphan
+        event_type_column = model.event_type
+
+        def state_condition(event_type: str):
+            if event_type == EventType.TASK_ORPHANED.value:
+                return is_orphan.is_(True)
+            return and_(
+                event_type_column == event_type,
+                or_(is_orphan.is_(False), is_orphan.is_(None))
+            )
+
+        event_types = [et for et in (state_to_event_type(v) for v in values) if et]
+        if not event_types:
+            return query
+
+        if operator in ('is', '', 'not'):
+            event_types = event_types[:1]
+        condition = or_(*(state_condition(et) for et in event_types))
+
+        if operator in ('not', 'not_in'):
+            return query.filter(~condition)
+        return query.filter(condition)
 
     def _apply_sorting(self, query, sort_by: Optional[str], sort_order: str, model=TaskEventDB):
         """Apply sorting to a query."""
